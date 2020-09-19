@@ -3,6 +3,9 @@
 ## Name: encryptNship
 ## Description: This app was created to meet a requirement to ship data packets that have client side
 ## encryption.
+## if that requirement is not needed logstash has a direct to S3 output parameter that supports SSE
+## Use that! Not this!
+##
 ## Authour: Shane Gleeson
 
 import argparse, os, logging, configparser, sys, base64, gzip, shutil, datetime
@@ -16,7 +19,7 @@ from logging.handlers import RotatingFileHandler
 
 ## Main Global Settings
 config_dir = "/opt/encryptnship/conf/"
-sleep_delay = 10
+sleep_delay = 300
 log_level = logging.INFO
 log_file = '/var/log/encryptnship/encryptnship.log'
 
@@ -96,6 +99,7 @@ def create_data_key(cmk_id, region, encryption_context, key_spec='AES_256'):
 
 def encrypt(filename, cmk_id, region, encryption_context):
     if filename.endswith("encrypt"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
         return filename
     # I grabbed this off the internet and add the region as a function argument
     if not os.path.exists(filename) or filename == False:
@@ -136,7 +140,11 @@ def encrypt(filename, cmk_id, region, encryption_context):
     return file
 
 def compress(filename):
+    if filename.endswith("encrypt"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
+        return filename
     if filename.endswith("gz"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
         return filename
     out_file = filename + ".gz"
     if not os.path.exists(filename):
@@ -182,6 +190,12 @@ def log_dirs(root_log_dir):
 
 def log_files(log_dir, delay=61):
     try:
+        if not os.path.isdir(log_dir):
+            os.mkdir(log_dir)
+            logging.info ("Successfully created the directory %s " % log_dir)
+    except OSError:
+        logging.critical ("Creation of the directory %s failed" % log_dir)
+    try:
         logs = [x for x in os.listdir(path=log_dir)if not os.path.isdir(log_dir+"/"+x) if modification_date(log_dir + x) < datetime.datetime.now() - datetime.timedelta(seconds=delay)]
     except FileNotFoundError:
         logging.critical("Log folder does not exist: {}".format(log_dir))
@@ -189,6 +203,59 @@ def log_files(log_dir, delay=61):
     logging.debug("log files need to be older than: {}".format(datetime.datetime.now()-datetime.timedelta(seconds=delay)))
     logging.debug("list of logs to process: {}".format(logs))
     return logs
+
+def file_move(filename):
+    ## Don't rename files from the payments_table directory.
+    if filename.startswith("/opt/encryptnship/logexchange/table"):
+        return filename
+    if filename.endswith("log"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
+        return filename
+    if filename.endswith("gz"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
+        return filename
+    if filename.endswith("encrypt"):
+        logging.info("Skipping file rename. File extension shows it's been previously processed")
+        return filename
+    now = datetime.datetime.now()
+    out_file = filename + "_" + now.strftime("%Y-%m-%d-%H_%M") + ".log"
+    try:
+        os.rename(filename, out_file)
+    except Exception as e:
+        logging.error(e)
+        return False
+    return out_file
+
+def fileConcat (fileOut, logDir, fileList):
+    if logDir.startswith("/opt/encryptnship/logexchange/table"):
+        return fileList
+    try:
+        # Open fileout in write mode
+        MergedFile = logDir + fileOut
+        with open(MergedFile, 'w') as outfile:
+            # Iterate through list
+            for names in fileList:
+                # Open each file in read mode
+                logging.debug("log file merging: {}".format(names))
+                name = logDir + names
+                with open(name) as infile:
+                    outfile.write(infile.read())
+                outfile.write("\n")
+    except Exception as e:
+        logging.error(e)
+        sys.exit(1)
+    fileList2 = fileList.copy()
+    logging.debug("list of logs to cleanup: {}".format(fileList))
+    for f in fileList:
+        logging.debug("cleaning up after successful merge: {}".format(f))
+        name = logDir + f
+        logging.debug("cleaning up: {}".format(name))
+        cleanup(name)
+        logging.debug("removing {} from list".format(f))
+        fileList2.remove(f)
+    fileList2.append(fileOut)
+    return fileList2
+
 
 def cleanup(filename):
     try:
@@ -198,6 +265,11 @@ def cleanup(filename):
         return False
     logging.debug("{} has been deleted".format(filename))
     return True
+
+def access_date(filename):
+    t = os.path.getatime(filename)
+    logging.debug("{} was last modified {}".format(filename,datetime.datetime.fromtimestamp(t)))
+    return datetime.datetime.fromtimestamp(t)
 
 def modification_date(filename):
     t = os.path.getmtime(filename)
@@ -218,39 +290,44 @@ if __name__ == "__main__":
     logging.info("###############################################")
     logging.info("EncryptNShip is starting ...")
     logging.info("Configuration File Directory set to: {}".format(config_dir))
+    logging.info("Processing delay set to: {} (seconds)".format(sleep_delay))
+
     while True:
         config_list = config_reader(config_dir)
+        ## Set a delay here so there is 5 minute gap between sends
+        logging.info("Delay started")
+        time.sleep(sleep_delay)
+        logging.info("Delay ended")
         for conf_dict in config_list:
-            ## Set a delay here so the app isn't as responsive
-            ## this isn't necessary
-            time.sleep(sleep_delay)
             for conf_file, p_info in conf_dict.items():
                 ## This loop controls the parameters set in the conf files
                 ## creates a list of files to ship, sets the AWS access info
                 logging.debug("Configuration File: {}".format(conf_file))
+                ## List of files, not including path
                 log_file_list = log_files(p_info["log_dir"])
-                if len(log_file_list) > 0:
-                    logging.info("Number of files to process: {}".format(len(log_file_list)))
                 ## Setting global AWS values for the config
                 aws_access_key_id=p_info["aws_access_key_id"]
                 aws_secret_access_key=p_info["aws_secret_access_key"]
-                for log_file_name in log_file_list:
-                    logging.info("logfile to be processed: {}".format(log_file_name))
-                    ## Make file name we're working with have the full path
-                    file_original = p_info["log_dir"]+ log_file_name
-                    logging.debug("logfile full path: {}".format(file_original))
-                    ## Compress file, if something goes wrong don't delete the original
-                    file_compressed = compress(file_original)
-                    if not file_compressed == False:
-                        cleanup(file_original)
-                    ## Encrypt the file, if something goes wrong don't delete the original
-                    file_encrypted = encrypt(file_compressed, p_info["cmk_id"], p_info["region"], p_info["encryption_context"])
-                    if not file_encrypted == False:
-                        cleanup(file_compressed)
-                    ## Send the file to S3, if something goes wrong don't delete the encrypted file
-                    ship_S3(file_encrypted, p_info["S3_bucket"], p_info["bucket_folder"], p_info["SSEKMSKeyId"])
-                    if not file_compressed == False:
-                        cleanup(file_encrypted)
-
-
-
+                if log_file_list:
+                    app_name = log_file_list[0].split('-',1)
+                    now = datetime.datetime.now()
+                    fileOut = app_name[0] + "_ship_" + now.strftime("%Y-%m-%d-%H_%M") + ".log"
+                    log_file_list2 = fileConcat(fileOut, p_info["log_dir"], log_file_list)
+                    for log_file_name in log_file_list2:
+                        logging.info("logfile to be processed: {}".format(log_file_name))
+                        ## Make file name we're working with have the full path
+                        file_original = p_info["log_dir"]+ log_file_name
+                        logging.debug("logfile full path: {}".format(file_original))
+                        ## Compress file, if something goes wrong don't delete the original
+                        file_compressed = compress(file_original)
+                        if not file_compressed == False:
+                            cleanup(file_original)
+                        ## Encrypt the file, if something goes wrong don't delete the original
+                        file_encrypted = encrypt(file_compressed, p_info["cmk_id"], p_info["region"], p_info["encryption_context"])
+                        if not file_encrypted == False:
+                            cleanup(file_compressed)
+                          ## Send the file to S3, if something goes wrong don't delete the encrypted file
+                        ship_S3(file_encrypted, p_info["S3_bucket"], p_info["bucket_folder"], p_info["SSEKMSKeyId"])
+                        logging.info("logfile sent to S3: {}".format(file_encrypted))
+                        if not file_compressed == False:
+                            cleanup(file_encrypted)
